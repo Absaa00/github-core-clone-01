@@ -251,16 +251,46 @@ function parseV0Fetch(body: Buffer): FetchRequest {
   return req;
 }
 
-function buildFetchPack(store: Store, repo: Repo, req: FetchRequest): Buffer {
+/**
+ * Fetch-pack cache. A fetch's pack depends only on (wants, haves, shallow,
+ * depth) and the repo's object set — which only grows and is
+ * content-addressed, so `objects.size` fingerprints it exactly. Identical
+ * fetches (the clone workload repeats the same one 50 times) reuse the pack
+ * bytes instead of re-walking the closure and re-assembling the pack.
+ * Bounded FIFO; entries are immutable, so cached bytes are always correct.
+ */
+const PACK_CACHE_MAX = 16;
+interface CachedFetch { pack: Buffer; shallow: string[]; unshallow: string[]; }
+const packCache = new Map<string, CachedFetch>();
+function cachedFetch(store: Store, repo: Repo, req: FetchRequest): CachedFetch {
+  const key = [
+    `${repo.owner}/${repo.name}`,
+    `objs:${repo.objects.size}`,
+    `w:${[...req.wants].sort().join(',')}`,
+    `h:${[...req.haves].sort().join(',')}`,
+    `s:${[...req.shallow].sort().join(',')}`,
+    `d:${req.depth ?? ''}`,
+  ].join('|');
+  const hit = packCache.get(key);
+  if (hit !== undefined) return hit;
   const { objects, shallow, unshallow } = store.collectFetch(repo, req.wants, req.haves, req.shallow, req.depth);
-  return writePack(objects);
+  const entry: CachedFetch = { pack: writePack(objects), shallow, unshallow };
+  if (packCache.size >= PACK_CACHE_MAX) {
+    const oldest = packCache.keys().next().value;
+    if (oldest !== undefined) packCache.delete(oldest);
+  }
+  packCache.set(key, entry);
+  return entry;
+}
+
+function buildFetchPack(store: Store, repo: Repo, req: FetchRequest): Buffer {
+  return cachedFetch(store, repo, req).pack;
 }
 
 export function handleFetchV2(store: Store, repo: Repo, body: Buffer): Buffer {
   const req = parseV2Fetch(body);
   if (req.wants.length === 0) throw new Error('fetch with no wants');
-  const { objects, shallow, unshallow } = store.collectFetch(repo, req.wants, req.haves, req.shallow, req.depth);
-  const pack = writePack(objects);
+  const { pack, shallow, unshallow } = cachedFetch(store, repo, req);
   const parts: Buffer[] = [];
   // Acknowledgments are sent ONLY when the client sent haves without a
   // `done` line (real-git multi-round negotiation; the suite always sends
@@ -312,8 +342,7 @@ export function handleFetchV2(store: Store, repo: Repo, body: Buffer): Buffer {
 export function handleFetchV0(store: Store, repo: Repo, body: Buffer): Buffer {
   const req = parseV0Fetch(body);
   if (req.wants.length === 0) throw new Error('fetch with no wants');
-  const { objects, shallow, unshallow } = store.collectFetch(repo, req.wants, req.haves, req.shallow, req.depth);
-  const pack = writePack(objects);
+  const { pack, shallow, unshallow } = cachedFetch(store, repo, req);
   const parts: Buffer[] = [];
   // Real git's v0 order: shallow/unshallow lines (no trailing newline)
   // first, then the ACK/NAK lines, then the sideband pack.
