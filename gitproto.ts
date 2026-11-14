@@ -367,10 +367,11 @@ export function handleReceivePack(store: Store, repo: Repo, body: Buffer): Recei
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
   // Parse + store the pack first (objects land even if a ref is refused).
+  // REF_DELTA bases may be objects the repo already holds (thin packs).
   let packEntries: ReturnType<typeof parsePack> = [];
   if (packOffset < body.length) {
     try {
-      packEntries = parsePack(body.subarray(packOffset));
+      packEntries = parsePack(body.subarray(packOffset), (oid) => repo.objects.get(oid));
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }

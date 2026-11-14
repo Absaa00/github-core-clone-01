@@ -136,6 +136,27 @@ export interface PackEntry {
   data: Buffer;
 }
 
+/**
+ * Deflate cache: an object's compressed bytes depend only on its oid
+ * (sha1 over type + size + data), so identical objects fetched again — the
+ * clone workload fetches the same 200 commits 50 times — reuse the bytes.
+ * Bounded FIFO (insertion order); objects are immutable, so cached bytes
+ * are always correct.
+ */
+const DEFLATE_CACHE_MAX = 4096;
+const deflateCache = new Map<string, Buffer>();
+function deflated(obj: PackEntry): Buffer {
+  const hit = deflateCache.get(obj.oid);
+  if (hit !== undefined) return hit;
+  const compressed = deflateSync(obj.data);
+  if (deflateCache.size >= DEFLATE_CACHE_MAX) {
+    const oldest = deflateCache.keys().next().value;
+    if (oldest !== undefined) deflateCache.delete(oldest);
+  }
+  deflateCache.set(obj.oid, compressed);
+  return compressed;
+}
+
 export function writePack(objects: PackEntry[]): Buffer {
   const parts: Buffer[] = [];
   const header = Buffer.alloc(12);
@@ -145,15 +166,77 @@ export function writePack(objects: PackEntry[]): Buffer {
   parts.push(header);
   for (const obj of objects) {
     parts.push(packObjectHeader(obj.type, obj.data.length));
-    parts.push(deflateSync(obj.data));
+    parts.push(deflated(obj));
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();
   return Buffer.concat([body, trailer]);
 }
 
-/** Parse a packfile with plain (non-delta) objects. Throws on delta/malformed. */
-export function parsePack(buf: Buffer): PackEntry[] {
+/**
+ * Apply a git delta to a base object's bytes. Delta format: varint source
+ * size, varint target size, then ops — 0x80|... = copy from base (offset/size
+ * encoded in the following bytes per the flag bits, size 0 means 0x10000),
+ * otherwise a literal insert of <op> bytes. Opcode 0 is invalid.
+ */
+export function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let p = 0;
+  const readVarint = (): number => {
+    let v = 0;
+    let s = 0;
+    let b: number;
+    do {
+      if (p >= delta.length) throw new Error('delta truncated in varint');
+      b = delta[p];
+      p += 1;
+      v |= (b & 0x7f) << s;
+      s += 7;
+    } while (b & 0x80);
+    return v;
+  };
+  const srcSize = readVarint();
+  const tgtSize = readVarint();
+  if (srcSize !== base.length) throw new Error('delta base size mismatch');
+  const out: Buffer[] = [];
+  while (p < delta.length) {
+    const op = delta[p];
+    p += 1;
+    if (op & 0x80) {
+      let off = 0;
+      let size = 0;
+      if (op & 0x01) { off = delta[p]; p += 1; }
+      if (op & 0x02) { off |= delta[p] << 8; p += 1; }
+      if (op & 0x04) { off |= delta[p] << 16; p += 1; }
+      if (op & 0x08) { off |= delta[p] << 24; p += 1; }
+      if (op & 0x10) { size = delta[p]; p += 1; }
+      if (op & 0x20) { size |= delta[p] << 8; p += 1; }
+      if (op & 0x40) { size |= delta[p] << 16; p += 1; }
+      if (size === 0) size = 0x10000;
+      if (off + size > base.length) throw new Error('delta copy out of range');
+      out.push(base.subarray(off, off + size));
+    } else if (op !== 0) {
+      if (p + op > delta.length) throw new Error('delta truncated in literal');
+      out.push(delta.subarray(p, p + op));
+      p += op;
+    } else {
+      throw new Error('delta opcode 0');
+    }
+  }
+  const result = Buffer.concat(out);
+  if (result.length !== tgtSize) throw new Error('delta target size mismatch');
+  return result;
+}
+
+/**
+ * Parse a packfile, resolving deltas. OFS_DELTA bases are earlier objects in
+ * the same pack (negative offset); REF_DELTA bases are looked up in the pack
+ * first, then via resolveBase (e.g. objects the repo already holds, for thin
+ * packs a real git client sends on push). Throws on malformed input.
+ */
+export function parsePack(
+  buf: Buffer,
+  resolveBase?: (oid: string) => GitObject | undefined,
+): PackEntry[] {
   if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') {
     throw new Error('not a packfile');
   }
@@ -161,9 +244,22 @@ export function parsePack(buf: Buffer): PackEntry[] {
   if (version !== 2) throw new Error(`unsupported pack version ${version}`);
   const count = buf.readUInt32BE(8);
   const out: PackEntry[] = [];
+  const byOffset = new Map<number, PackEntry>();
+  const byOid = new Map<string, PackEntry>();
+  const inflateAt = (off: number, expectedSize: number): { data: Buffer; next: number } => {
+    const { buffer, engine } = inflateSync(buf.subarray(off), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    if (buffer.length !== expectedSize) {
+      throw new Error(`pack object size mismatch: declared ${expectedSize}, got ${buffer.length}`);
+    }
+    return { data: buffer, next: off + engine.bytesWritten };
+  };
   let off = 12;
   for (let i = 0; i < count; i += 1) {
     if (off >= buf.length) throw new Error('pack truncated');
+    const entryStart = off;
     let byte = buf[off];
     off += 1;
     const typeNum = (byte >> 4) & 0x07;
@@ -176,18 +272,52 @@ export function parsePack(buf: Buffer): PackEntry[] {
       size |= (byte & 0x7f) << shift;
       shift += 7;
     }
-    if (typeNum === 6) throw new Error('ofs-delta packs are not accepted');
-    if (typeNum === 7) throw new Error('ref-delta packs are not accepted');
+    if (typeNum === 6) {
+      // OFS_DELTA: negative-offset varint, then the delta stream.
+      let b2 = buf[off];
+      off += 1;
+      let negOff = b2 & 0x7f;
+      while (b2 & 0x80) {
+        if (off >= buf.length) throw new Error('pack truncated in ofs-delta offset');
+        b2 = buf[off];
+        off += 1;
+        negOff = ((negOff + 1) << 7) | (b2 & 0x7f);
+      }
+      const baseEntry = byOffset.get(entryStart - negOff);
+      if (baseEntry === undefined) throw new Error('ofs-delta base not in pack');
+      const { data: delta, next } = inflateAt(off, size);
+      off = next;
+      const data = applyDelta(baseEntry.data, delta);
+      const entry: PackEntry = { oid: oidOf(baseEntry.type, data), type: baseEntry.type, data };
+      out.push(entry);
+      byOffset.set(entryStart, entry);
+      byOid.set(entry.oid, entry);
+      continue;
+    }
+    if (typeNum === 7) {
+      // REF_DELTA: 20-byte base oid, then the delta stream.
+      if (off + 20 > buf.length) throw new Error('pack truncated in ref-delta base');
+      const baseOid = buf.subarray(off, off + 20).toString('hex');
+      off += 20;
+      const baseEntry = byOid.get(baseOid) ?? resolveBase?.(baseOid);
+      if (baseEntry === undefined) throw new Error(`ref-delta base ${baseOid} not found`);
+      const { data: delta, next } = inflateAt(off, size);
+      off = next;
+      const data = applyDelta(baseEntry.data, delta);
+      const entry: PackEntry = { oid: oidOf(baseEntry.type, data), type: baseEntry.type, data };
+      out.push(entry);
+      byOffset.set(entryStart, entry);
+      byOid.set(entry.oid, entry);
+      continue;
+    }
     const type = PACK_TYPE_NAME[typeNum];
     if (type === undefined) throw new Error(`unknown pack object type ${typeNum}`);
-    // inflateSync with info:true exposes engine.bytesWritten = bytes consumed.
-    const { buffer, engine } = inflateSync(buf.subarray(off), { info: true }) as unknown as {
-      buffer: Buffer;
-      engine: { bytesWritten: number };
-    };
-    if (buffer.length !== size) throw new Error(`pack object size mismatch: declared ${size}, got ${buffer.length}`);
-    out.push({ oid: oidOf(type, buffer), type, data: buffer });
-    off += engine.bytesWritten;
+    const { data, next } = inflateAt(off, size);
+    off = next;
+    const entry: PackEntry = { oid: oidOf(type, data), type, data };
+    out.push(entry);
+    byOffset.set(entryStart, entry);
+    byOid.set(entry.oid, entry);
   }
   return out;
 }
